@@ -3,9 +3,11 @@
 Validates:
 1. Trace loader discovery and multi-format parsing (JSON/CSV, qualitative labels, continuous arrays).
 2. Zero Deadline Violations: ROSS completes phi = L on or before D across all real traces.
-3. Loose Deadline Savings: ROSS achieves higher cost savings than Uniform Progress when L/D <= 0.65.
-4. Competitive Ratio Bound: Realized cost ratio relative to OPT stays bounded within sqrt(K) + eps.
-5. Switching latency penalty overhead verification (~1% of compute length L).
+3. Loose Deadline Savings: ROSS achieves higher cost savings than Uniform Progress when
+   L/D <= (1+sqrt(K))/(1+2*sqrt(K)) (K-dependent crossover from Theorem 2).
+4. Competitive Ratio Bound: Realized cost ratio relative to OPT stays bounded within
+   the two-case Theorem 2 bound (sqrt(K) loose, 1+(K-1)*(2-D/L) tight).
+5. Switching latency penalty overhead verification (scales with K).
 """
 
 import math
@@ -30,7 +32,7 @@ from ross.traces import (
 from ross.scheduler_ross import ROSSScheduler
 from ross.scheduler_baselines import UniformProgressScheduler, GreedyScheduler
 from ross.simulator import run_policy, compare_policies, hindsight_optimal_cost
-from ross.validate import theoretical_competitive_ratio
+from ross.validate import theoretical_competitive_ratio, loose_deadline_ld_threshold
 
 
 class TestDatasetDiscoveryAndParsing:
@@ -159,20 +161,23 @@ class TestZeroDeadlineViolations:
 
 
 class TestLooseDeadlineSavings:
-    """Verifies that ROSS achieves higher cost savings than Uniform Progress when L/D <= 0.65."""
+    """Verifies that ROSS achieves higher cost savings than Uniform Progress in the loose-deadline
+    regime, where L/D <= (1+sqrt(K))/(1+2*sqrt(K)) (K-dependent crossover from Theorem 2)."""
 
-    def test_ross_savings_over_uniform_progress_on_real_traces(self):
-        """Under loose deadlines (L/D = 0.5 <= 0.65), ROSS exploits spot availability better than Uniform Progress."""
+    @pytest.mark.parametrize("K", [2.0, 5.0, 10.0])
+    def test_ross_savings_over_uniform_progress_per_k(self, K: float):
+        """Under loose deadlines (L/D well below the K-dependent crossover), ROSS exploits spot better."""
+        crossover_ld = loose_deadline_ld_threshold(K)
+        # Pick L/D safely inside the loose regime (80% of the crossover)
+        ld_ratio = crossover_ld * 0.80
+        L = 100.0
+        D = float(int(round(L / ld_ratio)))
+
         discovered = discover_trace_files("data")
-        # Select representative traces with intermittent availability
         target_files = [
             f for f in discovered["availability"] + discovered["preemption"]
             if any(k in f for k in ["us-east-1c", "us-east-1d", "us-east-1f", "us-west-2a", "us-west-2b"])
         ]
-
-        L = 100.0
-        D = 200.0  # L/D = 0.5 <= 0.65
-        K = 5.0
 
         total_windows = 0
         ross_savings_sum = 0.0
@@ -198,25 +203,71 @@ class TestLooseDeadlineSavings:
         avg_ross_savings = ross_savings_sum / total_windows
         avg_up_savings = up_savings_sum / total_windows
 
-        # On average across intermittent traces, ROSS achieves higher or equal savings
         assert avg_ross_savings >= avg_up_savings - 0.5, (
-            f"Expected ROSS savings ({avg_ross_savings:.2f}%) >= UP savings ({avg_up_savings:.2f}%)"
+            f"K={K}: Expected ROSS savings ({avg_ross_savings:.2f}%) >= UP savings ({avg_up_savings:.2f}%)"
         )
         assert (ross_outperformed_or_tied / total_windows) >= 0.70, (
-            f"ROSS should match or beat UP in >= 70% of loose windows, got {ross_outperformed_or_tied}/{total_windows}"
+            f"K={K}: ROSS should match or beat UP in >= 70% of loose windows, "
+            f"got {ross_outperformed_or_tied}/{total_windows}"
         )
+
+    @pytest.mark.parametrize("K", [2.0, 5.0, 10.0])
+    def test_crossover_boundary_above_and_below(self, K: float):
+        """Test that the loose-deadline advantage holds just below the K-dependent crossover
+        and does not necessarily hold just above it."""
+        crossover_ld = loose_deadline_ld_threshold(K)
+
+        # Just below crossover (loose side): L/D = crossover - 0.05
+        ld_below = crossover_ld - 0.05
+        L = 100.0
+        D_below = float(int(round(L / ld_below)))
+
+        # Just above crossover (tight side): L/D = crossover + 0.05
+        ld_above = min(crossover_ld + 0.05, 0.99)
+        D_above = float(int(round(L / ld_above)))
+
+        discovered = discover_trace_files("data")
+        sample_files = [discovered["availability"][1], discovered["preemption"][1]]
+
+        for path in sample_files:
+            tr = load_trace(path)
+
+            # Below crossover (loose): ROSS should generally match or beat Uniform Progress
+            windows_below = tr.sliding_windows(window_size=int(D_below), stride=400, max_windows=4)
+            for win in windows_below:
+                res = compare_policies(trace=win, L=L, D=D_below, K=K, seed=42, switch_penalty_pct=0.01)
+                ross_sav = res["ROSS (uniform)"].cost_savings_vs_on_demand_pct
+                up_sav = res["Uniform Progress"].cost_savings_vs_on_demand_pct
+                # In the loose regime, ROSS should perform at least competitively
+                assert ross_sav >= up_sav - 2.0, (
+                    f"K={K}, L/D={ld_below:.3f} (loose side): "
+                    f"ROSS savings {ross_sav:.2f}% fell far below UP savings {up_sav:.2f}%"
+                )
+
+            # Above crossover (tight): just verify both still complete on time (no savings assertion)
+            windows_above = tr.sliding_windows(window_size=int(D_above), stride=400, max_windows=4)
+            for win in windows_above:
+                res = compare_policies(trace=win, L=L, D=D_above, K=K, seed=42, switch_penalty_pct=0.01)
+                assert res["ROSS (uniform)"].completed, (
+                    f"K={K}, L/D={ld_above:.3f} (tight side): ROSS failed to complete"
+                )
 
 
 class TestCompetitiveRatioBound:
-    """Verifies that realized cost ratio relative to OPT stays bounded within theoretical bound sqrt(K) + eps."""
+    """Verifies that realized cost ratio relative to OPT stays bounded within Theorem 2 bound:
+    
+    CR_ROSS(D, L, K) = sqrt(K)                      if D/L >= (1 + 2*sqrt(K)) / (1 + sqrt(K))
+                     = 1 + (K - 1) * (2 - D/L)      otherwise
+    """
 
     @pytest.mark.parametrize("K", [2.0, 5.0, 9.0])
-    def test_realized_competitive_ratio_on_real_traces(self, K: float):
+    @pytest.mark.parametrize("ld_ratio", [0.5, 0.8])  # loose (D/L=2.0) and tight (D/L=1.25) regimes
+    def test_realized_competitive_ratio_on_real_traces(self, K: float, ld_ratio: float):
         discovered = discover_trace_files("data")
         sample_files = [discovered["availability"][1], discovered["preemption"][1]]
 
         L = 50.0
-        D = 100.0  # L/D = 0.5
+        D = float(int(round(L / ld_ratio)))
         th_cr = theoretical_competitive_ratio(D=D, L=L, K=K)
         epsilon = 0.15  # Discretization and sliding window tolerance
 
@@ -230,32 +281,55 @@ class TestCompetitiveRatioBound:
                     realized_cr = res.total_cost / res.opt_cost if res.opt_cost > 0 else 1.0
 
                     assert realized_cr <= th_cr + epsilon, (
-                        f"CR violation on {win.name}: realized={realized_cr:.3f} > theoretical={th_cr:.3f} + eps({epsilon})"
+                        f"CR violation on {win.name} (L={L}, D={D}, K={K}, L/D={ld_ratio}): "
+                        f"realized={realized_cr:.3f} > theoretical={th_cr:.3f} + eps({epsilon})"
                     )
 
 
 class TestStateSwitchingPenalty:
-    """Verifies state-switching latency penalty calculation in simulator.py."""
+    """Verifies state-switching latency penalty calculation and switch tracking in simulator.py."""
+
+    def test_idle_transitions_not_counted_as_switches(self):
+        """Transitions involving IDLE must NOT count as switches; only SPOT<->ON_DEMAND transitions do."""
+        # 1. SPOT -> IDLE -> SPOT sequence: switches must stay 0
+        trace_idle = Trace(availability=np.array([True, False, True] + [True] * 7, dtype=bool), name="spot_idle_spot")
+        greedy = GreedyScheduler(L=2.0, D=10.0, K=5.0)
+        # Step 0: spot -> SPOT (phi=1)
+        # Step 1: no spot -> IDLE (phi=1)
+        # Step 2: spot -> SPOT (phi=2, done)
+        res_idle = run_policy(scheduler=greedy, trace=trace_idle, dt=1.0)
+        assert res_idle.completed
+        assert res_idle.spot_time == 2.0
+        assert res_idle.idle_time == 1.0
+        assert res_idle.n_switches == 0, f"Expected 0 switches for SPOT->IDLE->SPOT, got {res_idle.n_switches}"
+
+        # 2. SPOT -> ON_DEMAND sequence: switches must be exactly 1
+        trace_od = Trace(availability=np.array([True, False, False, False], dtype=bool), name="spot_to_od")
+        # With L=2, D=3: step 0 takes SPOT, step 1 has no spot in greedy warmup -> takes ON_DEMAND (1 switch)
+        s = ROSSScheduler(L=2.0, D=3.0, K=5.0, warmup_mode="greedy")
+        res_od = run_policy(scheduler=s, trace=trace_od, dt=1.0)
+        assert res_od.completed
+        assert res_od.spot_time == 1.0
+        assert res_od.on_demand_time == 1.0
+        assert res_od.n_switches == 1, f"Expected 1 switch for SPOT->ON_DEMAND, got {res_od.n_switches}"
 
     def test_switching_penalty_applied_correctly(self):
-        # Create an alternating trace: True, False, True, False...
-        alt_pattern = np.array([True, False] * 50, dtype=bool)
-        trace = Trace(availability=alt_pattern, name="alternating")
+        from ross.simulator import compute_switch_penalty
+        # Alternating trace under ROSS (greedy warmup): takes SPOT when available, ON_DEMAND when unavailable
+        trace = Trace(availability=np.array([True, False] * 20, dtype=bool), name="alternating")
 
         L = 20.0
         D = 40.0
         K = 5.0
         switch_penalty_pct = 0.01
 
-        # Run scheduler with switch penalty 0
-        scheduler0 = UniformProgressScheduler(L=L, D=D, K=K)
+        scheduler0 = ROSSScheduler(L=L, D=D, K=K, warmup_mode="greedy", seed=42)
         res0 = run_policy(scheduler=scheduler0, trace=trace, switch_penalty_pct=0.0)
 
-        # Run scheduler with switch penalty 0.01
-        scheduler1 = UniformProgressScheduler(L=L, D=D, K=K)
+        scheduler1 = ROSSScheduler(L=L, D=D, K=K, warmup_mode="greedy", seed=42)
         res1 = run_policy(scheduler=scheduler1, trace=trace, switch_penalty_pct=switch_penalty_pct)
 
-        expected_switch_unit = switch_penalty_pct * L
+        expected_switch_unit = compute_switch_penalty(K=K, switch_penalty_pct=switch_penalty_pct)
         expected_switch_overhead = res1.n_switches * expected_switch_unit
 
         assert res1.n_switches > 0

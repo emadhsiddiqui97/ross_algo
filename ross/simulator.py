@@ -43,6 +43,14 @@ def hindsight_optimal_cost(D: float, L: float, K: float, trace: Trace) -> float:
     return spot_used * 1.0 + on_demand_needed * float(K)
 
 
+def compute_switch_penalty(K: float, switch_penalty_pct: float = 0.01) -> float:
+    """Computes overhead cost per state switch, scaling with On-Demand cost ratio K.
+    
+    A provisioning/switching delay incurs overhead proportional to on-demand cost rate K (overhead_frac * K).
+    """
+    return switch_penalty_pct * K
+
+
 def run_policy(
     scheduler: BaseScheduler,
     trace: Trace,
@@ -85,9 +93,9 @@ def run_policy(
     completed = scheduler.is_done()
     finish_time = scheduler.state.t if completed else scheduler.D
     
-    # Calculate costs and state-switching latency overhead (~1% of compute length L as per Section V-A)
+    # Calculate costs and state-switching latency overhead (scales with on-demand cost ratio K)
     base_cost = scheduler.state.cost
-    switch_penalty_unit = switch_penalty_pct * L
+    switch_penalty_unit = compute_switch_penalty(K=K, switch_penalty_pct=switch_penalty_pct)
     switch_overhead = scheduler.state.switches * switch_penalty_unit
     total_cost = base_cost + switch_overhead
 

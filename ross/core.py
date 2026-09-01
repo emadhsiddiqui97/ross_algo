@@ -37,6 +37,7 @@ class SchedulerState:
     cost: float = 0.0                  # Total cost accumulated
     switches: int = 0                  # Number of state switches
     last_action: Optional[Action] = None # Previous action taken
+    last_active_action: Optional[Action] = None # Previous active compute action (SPOT or ON_DEMAND)
     on_demand_time: float = 0.0        # Time spent renting On-Demand
     spot_time: float = 0.0             # Time spent renting Spot
     idle_time: float = 0.0             # Time spent idling
@@ -50,6 +51,7 @@ class SchedulerState:
             cost=self.cost,
             switches=self.switches,
             last_action=self.last_action,
+            last_active_action=self.last_active_action,
             on_demand_time=self.on_demand_time,
             spot_time=self.spot_time,
             idle_time=self.idle_time,
@@ -96,9 +98,11 @@ class BaseScheduler(ABC):
             self.state.phase = Phase.DONE
             return
 
-        # Track switches (only after an initial action has been taken)
-        if self.state.last_action is not None and self.state.last_action != action:
-            self.state.switches += 1
+        # Track state switches: only active SPOT <-> ON_DEMAND transitions incur switching penalty (IDLE excluded)
+        if action in (Action.SPOT, Action.ON_DEMAND):
+            if self.state.last_active_action is not None and self.state.last_active_action != action:
+                self.state.switches += 1
+            self.state.last_active_action = action
 
         # Advance compute and time
         self.state.t += dt

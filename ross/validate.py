@@ -13,7 +13,7 @@ from ross.traces import Trace
 def theoretical_competitive_ratio(D: float, L: float, K: float) -> float:
     """Computes the theoretical upper bound on the competitive ratio (Theorem 2).
     
-    CR_ROSS(D, L, K) = sqrt(K)                          if D >= (1+2*sqrt(K))/(1+sqrt(K)) * L
+    CR_ROSS(D, L, K) = sqrt(K)                          if D/L >= (1+2*sqrt(K))/(1+sqrt(K))
                      = 1 + (K-1)*(2 - D/L)              otherwise
     """
     sqrt_k = math.sqrt(K)
@@ -22,6 +22,20 @@ def theoretical_competitive_ratio(D: float, L: float, K: float) -> float:
         return sqrt_k
     else:
         return 1.0 + (K - 1.0) * (2.0 - (D / L))
+
+
+# Standalone alias for Theorem 2 theoretical competitive ratio bound
+theoretical_cr_bound = theoretical_competitive_ratio
+
+
+def loose_deadline_ld_threshold(K: float) -> float:
+    """Returns the L/D crossover below which the loose-deadline regime holds (Theorem 2).
+    
+    The loose regime is D/L >= (1 + 2*sqrt(K)) / (1 + sqrt(K)), equivalently
+    L/D <= (1 + sqrt(K)) / (1 + 2*sqrt(K)).
+    """
+    sqrt_k = math.sqrt(K)
+    return (1.0 + sqrt_k) / (1.0 + 2.0 * sqrt_k)
 
 
 @dataclass
