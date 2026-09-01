@@ -1,45 +1,62 @@
-"""Prediction-augmented ROSS scheduler and forecast signals (Part B)."""
+"""Prediction-augmented ROSS: rolling unavailability forecast + injection-offset bias."""
 
 import math
 from typing import Optional, Sequence
+
 import numpy as np
 
-from ross.core import Action, Phase
 from ross.scheduler_ross import ROSSScheduler
 
 
-class SpotForecaster:
-    """Lightweight predictor of near-term spot availability."""
+def forecast_unavailability_rates(
+    history: Sequence[bool],
+    n_starts: int,
+    delta: float,
+    window_len: float,
+    lookback: Optional[int] = None,
+) -> np.ndarray:
+    """Empirical unavailability rate for each candidate injection start.
 
-    def __init__(self, window_size: int = 20):
-        self.window_size = window_size
-        self.history: list[bool] = []
+    Uses the last ``lookback`` ticks (default: ``window_len``) as a template for
+    the upcoming injection interval. Candidate ``i`` is scored by the fraction
+    of unavailable ticks in the aligned sub-window of length ``delta``.
 
-    def update(self, spot_available: bool) -> None:
-        self.history.append(spot_available)
+    Returns an array of shape ``(n_starts,)`` with values in ``[0, 1]``.
+    """
+    n_starts = max(1, int(n_starts))
+    w = max(1, int(round(window_len)))
+    d = max(1, int(round(delta)))
+    d = min(d, w)
+    lb = int(lookback) if lookback is not None else w
+    lb = max(d, lb)
 
-    def predict_unavailability_density(self, horizon: int) -> np.ndarray:
-        """Predicts probability density of spot unavailability over the future horizon.
-        
-        Returns a normalized 1D probability distribution over the horizon bins.
-        """
-        if len(self.history) < 2:
-            return np.ones(horizon) / max(1, horizon)
-        
-        recent = self.history[-self.window_size:]
-        unavail_rate = 1.0 - float(np.mean(recent))
-        
-        # Default smooth distribution weighted by recent unavailability
-        weights = np.ones(horizon) * max(0.01, unavail_rate)
-        total = np.sum(weights)
-        return weights / total if total > 0 else np.ones(horizon) / max(1, horizon)
+    hist = np.asarray(list(history), dtype=bool)
+    if hist.size == 0:
+        return np.full(n_starts, 0.5)
+
+    template = hist[-lb:]
+    if template.size < w:
+        template = np.concatenate(
+            [np.ones(w - template.size, dtype=bool), template]
+        )
+    else:
+        template = template[-w:]
+
+    unavail = ~template
+    max_start = max(0, w - d)
+    rates = np.empty(n_starts, dtype=float)
+    for i in range(n_starts):
+        start = int(round(i * max_start / max(n_starts - 1, 1)))
+        rates[i] = float(np.mean(unavail[start : start + d]))
+    return rates
 
 
 class PredictionAugmentedROSS(ROSSScheduler):
-    """Prediction-augmented ROSS scheduling algorithm (Part B).
-    
-    Blends uniform random injection window sampling with forecast-weighted sampling.
-    When lambda_ = 0.0, behavior is strictly identical to vanilla ROSS.
+    """ROSS with mixture sampling of the injection start offset.
+
+    ``lambda_ = 0`` is identical to vanilla ROSS (same RNG draws).
+    ``lambda_ = 1`` samples start offsets weighted by forecast unavailability.
+    Intermediate values mix the two with a coin flip of probability ``lambda_``.
     """
 
     def __init__(
@@ -50,52 +67,90 @@ class PredictionAugmentedROSS(ROSSScheduler):
         lambda_: float = 0.0,
         warmup_mode: str = "greedy",
         seed: Optional[int] = None,
+        history: Optional[Sequence[bool]] = None,
+        lookback: Optional[int] = None,
     ):
         if not (0.0 <= lambda_ <= 1.0):
             raise ValueError(f"lambda_ must be in [0.0, 1.0], got {lambda_}")
-        
         self.lambda_ = float(lambda_)
-        self.forecaster = SpotForecaster()
+        self.lookback = lookback
+        self._fit_history = list(history) if history is not None else []
+        self.history: list[bool] = list(self._fit_history)
+        self._obs: Optional[bool] = None
         super().__init__(L=L, D=D, K=K, warmup_mode=warmup_mode, seed=seed)
 
+    def decide(self, spot_available: bool):
+        self._obs = bool(spot_available)
+        return super().decide(spot_available)
+
+    def advance(self, dt: float, action) -> None:
+        if self._obs is not None:
+            self.history.append(self._obs)
+            self._obs = None
+        super().advance(dt, action)
+
+    def reset(self) -> None:
+        self.history = list(self._fit_history)
+        self._obs = None
+        super().reset()
+
     def _trigger_injection_setup(self) -> None:
-        """Sets up the randomized injection window with forecast weighting."""
-        self.state.phase = Phase.INJECTION
-        self.xi1 = self.state.t
-        remaining_work = max(0.0, self.L - self.state.phi)
-        sqrt_k = math.sqrt(self.K)
-        self.delta = remaining_work / (1.0 + sqrt_k)
-
-        window_len = remaining_work
-        self.injection_window_end = self.xi1 + window_len
-        max_offset = max(0.0, window_len - self.delta)
-
-        if max_offset <= 1e-9:
-            self.sigma = self.xi1
+        super()._trigger_injection_setup()
+        if self.lambda_ == 0.0:
             return
 
-        if self.lambda_ <= 1e-9:
-            # Strictly vanilla ROSS: Uniform random sampling
-            offset = float(self.rng.uniform(0.0, max_offset))
-        else:
-            # Discretize possible start offsets into bins
-            num_bins = max(10, int(max_offset))
-            bin_offsets = np.linspace(0.0, max_offset, num_bins)
-            
-            # Uniform prior
-            p_uniform = np.ones(num_bins) / num_bins
-            
-            # Forecast distribution
-            p_forecast = self.forecaster.predict_unavailability_density(num_bins)
-            
-            # Mixture sampling
-            p_mixture = (1.0 - self.lambda_) * p_uniform + self.lambda_ * p_forecast
-            p_mixture = p_mixture / np.sum(p_mixture)
-            
-            chosen_bin = self.rng.choice(num_bins, p=p_mixture)
-            offset = float(bin_offsets[chosen_bin])
+        window_len = (
+            (self.injection_window_end - self.xi1)
+            if self.injection_window_end is not None and self.xi1 is not None
+            else max(0.0, self.L - self.state.phi)
+        )
+        max_offset = max(0.0, window_len - (self.delta or 0.0))
+        if max_offset <= 1e-9:
+            return
 
-        self.sigma = self.xi1 + offset
+        if self.lambda_ < 1.0 and float(self.rng.random()) >= self.lambda_:
+            self.sigma = self.xi1 + float(self.rng.uniform(0.0, max_offset))
+            return
 
-    def advance(self, dt: float, action: Action) -> None:
-        super().advance(dt, action)
+        n_starts = max(2, int(math.floor(max_offset)) + 1)
+        rates = forecast_unavailability_rates(
+            self.history,
+            n_starts=n_starts,
+            delta=self.delta or 1.0,
+            window_len=window_len,
+            lookback=self.lookback,
+        )
+        weights = rates.copy()
+        if float(np.sum(weights)) <= 1e-12:
+            weights = np.ones(n_starts)
+        weights = weights / np.sum(weights)
+        offsets = np.linspace(0.0, max_offset, n_starts)
+        idx = int(self.rng.choice(n_starts, p=weights))
+        self.sigma = self.xi1 + float(offsets[idx])
+
+
+class SpotForecaster:
+    """Thin wrapper around ``forecast_unavailability_rates`` for package exports."""
+
+    def __init__(self, window_size: int = 20):
+        self.window_size = window_size
+        self.history: list[bool] = []
+
+    def update(self, spot_available: bool) -> None:
+        self.history.append(bool(spot_available))
+
+    def fit(self, history: Sequence[bool]) -> None:
+        self.history = list(history)
+
+    def predict_unavailability_density(self, horizon: int) -> np.ndarray:
+        rates = forecast_unavailability_rates(
+            self.history,
+            n_starts=max(1, horizon),
+            delta=1.0,
+            window_len=float(self.window_size),
+            lookback=self.window_size,
+        )
+        total = float(np.sum(rates))
+        if total <= 1e-12:
+            return np.ones(len(rates)) / len(rates)
+        return rates / total
