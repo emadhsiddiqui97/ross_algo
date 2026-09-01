@@ -35,7 +35,6 @@ htmlcov/
 
 # IDEs
 .idea/
-.vscode/
 *.swp
 *.swo
 
@@ -49,3 +48,9 @@ reports/*.png
 reports/*.svg
 reports/*.pdf
 !reports/.gitkeep
+config.bat
+node_modules
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
