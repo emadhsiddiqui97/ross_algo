@@ -1,0 +1,51 @@
+# Virtual environment
+.venv/
+env/
+venv/
+ENV/
+
+# Python caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Testing & Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Large trace files (raw dumps)
+data/traces/*.csv
+data/traces/*.parquet
+!data/traces/.gitkeep
+
+# Output reports and figures
+reports/*.png
+reports/*.svg
+reports/*.pdf
+!reports/.gitkeep
